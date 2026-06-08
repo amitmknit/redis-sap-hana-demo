@@ -11,12 +11,26 @@ All timings are real — compare cached vs uncached response times live.
 """
 
 import os, json, time, uuid, secrets
+from decimal import Decimal
+from datetime import datetime, date
 import redis
 import psycopg2
 import psycopg2.extras
 from flask import Flask, jsonify, request, render_template_string
 
 app = Flask(__name__)
+
+# ── Custom JSON encoder — handles Decimal and date types from PostgreSQL ───────
+class SafeEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, Decimal):
+            return float(obj)
+        if isinstance(obj, (datetime, date)):
+            return str(obj)
+        return super().default(obj)
+
+def safe_dumps(data):
+    return json.dumps(data, cls=SafeEncoder)
 
 # ── Connections ────────────────────────────────────────────────────────────────
 r = redis.Redis(
@@ -44,7 +58,6 @@ def home():
 
 # ══════════════════════════════════════════════════════════════════════════════
 # USE CASE 1 — HANA READ OFFLOAD
-# GET /material/<id>?bypass_cache=true  to force a cold read
 # ══════════════════════════════════════════════════════════════════════════════
 @app.route("/material/<material_id>")
 def get_material(material_id):
@@ -77,15 +90,13 @@ def get_material(material_id):
         return jsonify({"error": "Material not found"}), 404
 
     data = dict(row)
-    data["last_changed"] = str(data["last_changed"])
-
     # Populate Redis with TTL=60s
-    r.setex(cache_key, 60, json.dumps(data))
+    r.setex(cache_key, 60, safe_dumps(data))
 
     return jsonify({
         "source": "SAP HANA (cache miss — now cached ⏳)",
         "latency_ms": elapsed_ms,
-        "data": data,
+        "data": json.loads(safe_dumps(data)),
         "message": "Fetched from HANA and written to Redis cache (TTL 60s)"
     })
 
@@ -111,9 +122,7 @@ def create_session():
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "client": "100"
     }
-    # Write session to Redis with 30-minute TTL — HANA never touched
     r.setex(session_id, 1800, json.dumps(session_data))
-
     return jsonify({
         "session_id": session_id,
         "ttl_seconds": 1800,
@@ -127,10 +136,8 @@ def read_session(session_id):
     t0 = time.perf_counter()
     raw = r.get(session_id)
     elapsed_ms = round((time.perf_counter() - t0) * 1000, 3)
-
     if not raw:
         return jsonify({"error": "Session not found or expired"}), 404
-
     ttl = r.ttl(session_id)
     return jsonify({
         "source": "Redis ✅",
@@ -141,7 +148,6 @@ def read_session(session_id):
 
 # ══════════════════════════════════════════════════════════════════════════════
 # USE CASE 3 — RDI / CDC SIMULATION
-# Simulate a SAP HANA price-change event flowing through Redis Streams
 # ══════════════════════════════════════════════════════════════════════════════
 STREAM_KEY = "sap:cdc:material_master"
 
@@ -150,8 +156,6 @@ def publish_cdc_event():
     body = request.get_json(silent=True) or {}
     material_id = body.get("material_id", "MAT-001")
     new_price = body.get("new_price", 4500.00)
-
-    # Write CDC event to Redis Streams (simulates RDI connector output)
     event_id = r.xadd(STREAM_KEY, {
         "operation": "UPDATE",
         "table": "material_master",
@@ -161,10 +165,7 @@ def publish_cdc_event():
         "source_lsn": f"LSN-{int(time.time())}",
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     })
-
-    # Also invalidate the Redis cache entry so next read pulls fresh HANA data
     invalidated = r.delete(f"mat:{material_id}")
-
     return jsonify({
         "stream": STREAM_KEY,
         "event_id": event_id,
@@ -184,33 +185,25 @@ def read_stream():
 
 # ══════════════════════════════════════════════════════════════════════════════
 # USE CASE 4 — REPORTING ACCELERATION
-# Pre-materialise heavy department-spend report into Redis
 # ══════════════════════════════════════════════════════════════════════════════
 REPORT_KEY = "report:dept_spend:latest"
 
 @app.route("/report/refresh", methods=["POST"])
 def refresh_report():
-    """Simulate a scheduled or RDI-triggered report materialisation job."""
     t0 = time.perf_counter()
-    time.sleep(0.08)  # simulate the heavy HANA analytical query (~80 ms)
-
+    time.sleep(0.08)
     conn = get_pg()
     cur = conn.cursor()
     cur.execute("SELECT * FROM report_department_spend ORDER BY total_value DESC")
-    rows = [dict(r) for r in cur.fetchall()]
+    rows = [dict(row) for row in cur.fetchall()]
     conn.close()
-
-    for row in rows:
-        row["report_date"] = str(row["report_date"])
-
     report = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "source": "SAP HANA analytical query (materialised)",
         "rows": rows
     }
-    r.setex(REPORT_KEY, 300, json.dumps(report))  # cache for 5 minutes
+    r.setex(REPORT_KEY, 300, safe_dumps(report))
     elapsed_ms = round((time.perf_counter() - t0) * 1000, 3)
-
     return jsonify({
         "message": "Report materialised from HANA and cached in Redis (TTL 5 min)",
         "hana_query_ms": elapsed_ms,
@@ -222,14 +215,12 @@ def get_report():
     t0 = time.perf_counter()
     cached = r.get(REPORT_KEY)
     elapsed_ms = round((time.perf_counter() - t0) * 1000, 3)
-
     if cached:
         report = json.loads(cached)
         report["served_from"] = "Redis (sub-millisecond ✅)"
         report["redis_latency_ms"] = elapsed_ms
         report["message"] = "Analytical report served from Redis — HANA was NOT queried"
         return jsonify(report)
-
     return jsonify({
         "error": "Report not yet materialised",
         "message": "POST /report/refresh first to materialise the report from HANA into Redis"
@@ -302,13 +293,12 @@ HTML_DASHBOARD = """
 
 <div class="grid">
 
-  <!-- USE CASE 1 -->
   <div class="card">
     <h3>① HANA Read Offload <span class="badge">~30–40% HANA load reduction</span></h3>
     <div class="tag">Cache-aside pattern</div>
     <p style="font-size:.85rem;color:#94a3b8">Cache material master reads in Redis. First call hits HANA (~40ms). Second call is served from Redis (&lt;1ms). See the latency difference live.</p>
     <label>Material ID</label><br>
-    <input id="matId" value="MAT-001"> 
+    <input id="matId" value="MAT-001">
     <br><br>
     <button onclick="fetchMaterial(false)">Read (use cache)</button>
     <button class="sec" onclick="fetchMaterial(true)">Read (bypass cache)</button>
@@ -316,7 +306,6 @@ HTML_DASHBOARD = """
     <pre id="mat-out">← click a button to run</pre>
   </div>
 
-  <!-- USE CASE 2 -->
   <div class="card">
     <h3>② Fiori Session Management <span class="badge">2.4M SQL queries/day eliminated</span></h3>
     <div class="tag">Session store pattern</div>
@@ -329,7 +318,6 @@ HTML_DASHBOARD = """
     <pre id="sess-out">← create a session first</pre>
   </div>
 
-  <!-- USE CASE 3 -->
   <div class="card">
     <h3>③ RDI / CDC Event Stream <span class="badge">Real-time HANA change events</span></h3>
     <div class="tag">Redis Streams pattern</div>
@@ -344,7 +332,6 @@ HTML_DASHBOARD = """
     <pre id="cdc-out">← publish an event first</pre>
   </div>
 
-  <!-- USE CASE 4 -->
   <div class="card">
     <h3>④ Reporting Acceleration <span class="badge">HANA protected from analytical spikes</span></h3>
     <div class="tag">Pre-materialised report pattern</div>
@@ -356,7 +343,6 @@ HTML_DASHBOARD = """
 
 </div>
 
-<!-- Redis Stats -->
 <div style="margin-top:20px">
   <button onclick="getRedisInfo()" style="background:#2d3748">📊 Redis Stats (hits / misses / keys)</button>
   <pre id="info-out" style="margin-top:8px;display:none"></pre>
