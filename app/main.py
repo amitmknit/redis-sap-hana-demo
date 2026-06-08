@@ -5,7 +5,7 @@ Four use cases mapped to real NSW Police SAP scenarios:
 
   1. HANA Read Offload    — Equipment & asset master data cache
   2. Fiori Session Mgmt  — Officer portal session management
-  3. RDI / CDC Streams   — Real-time equipment assignment propagation
+  3. CDC / Event Streams  — Real-time equipment assignment propagation (OData polling sim)
   4. Reporting + Search  — Operational dashboards + Redis Search on officer/asset data
 """
 
@@ -234,7 +234,7 @@ def create_session():
         "session_id": session_id,
         "ttl_seconds": 1800,
         "stored_in": "Redis ONLY — SAP HANA NOT written to ✅",
-        "impact": "In a 10,000-officer force: ~2.4M daily HANA SQL queries eliminated",
+        "impact": "Based on the SAP SuccessFactors published study: ~2.4M daily HANA SQL queries eliminated through session offload. NSW Police impact requires PoC sizing.",
         "session": session_data
     })
 
@@ -254,9 +254,19 @@ def read_session(session_id):
     })
 
 # ══════════════════════════════════════════════════════════════════════════════
-# USE CASE 3 — REAL-TIME EQUIPMENT ASSIGNMENT VIA CDC STREAMS
-# NSW Police: Sergeant reassigns equipment in SAP → Redis propagates change
-# instantly to COPS, CAD, asset register — no overnight batch job.
+# USE CASE 3 — SAP HANA → REDIS: CDC / CHANGE EVENT STREAMING
+#
+# NSW Police: Sergeant reassigns equipment in SAP → change detected →
+# Redis Streams notifies COPS, CAD, Asset Register in <100ms.
+#
+# INTEGRATION NOTE (PoC required):
+# In a real SAP HANA environment, the change event would be captured by one of:
+#   Option A — SAP SLT (trigger-based CDC, near real-time, ~5-10% write overhead)
+#   Option B — OData polling (app-layer polling, seconds latency, zero SAP impact)
+#   Option C — SAP BTP Integration Suite (event-driven, requires BTP licence)
+#   Option D — Custom ABAP exit (most control, highest effort)
+# This demo simulates Option B (OData polling) — the safest PoC starting point.
+# RDI does NOT support SAP HANA as a source (supports Oracle/SQL Server/PostgreSQL).
 # ══════════════════════════════════════════════════════════════════════════════
 STREAM_KEY = "nsw.police:sap:equipment_changes"
 
@@ -269,25 +279,32 @@ def publish_cdc_event():
     old_value    = body.get("old_value", "EMP-1004")
     new_value    = body.get("new_value", officer_id)
 
-    # RDI captures this from HANA transaction log and writes to Redis Streams
+    # ── Simulate OData polling detecting a change in SAP HANA ────────────────
+    # In production this would be triggered by:
+    #   - SAP SLT detecting a row change in EQUI table via trigger-based CDC, OR
+    #   - A polling service calling GET /sap/opu/odata/sap/API_EQUIPMENT/... 
+    #     and detecting a changed ETag / LastChangeDateTime field
+    # The integration layer then writes the event to Redis Streams.
+    # ─────────────────────────────────────────────────────────────────────────
     event_id = r.xadd(STREAM_KEY, {
-        "operation":    "UPDATE",
-        "sap_table":    "EQUI",                          # SAP equipment master table
-        "asset_id":     asset_id,
-        "change_type":  change_type,
-        "officer_id":   officer_id,
-        "old_value":    old_value,
-        "new_value":    new_value,
-        "source_lsn":   f"LSN-{int(time.time())}",      # HANA transaction log position
-        "source_system":"SAP_ECC_NSWPOL",
-        "timestamp":    time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "operation":         "UPDATE",
+        "sap_table":         "EQUI",           # SAP equipment master table
+        "asset_id":          asset_id,
+        "change_type":       change_type,
+        "officer_id":        officer_id,
+        "old_assigned_to":   old_value,
+        "new_assigned_to":   new_value,
+        "integration_path":  "OData-polling",  # PoC: swap to SLT-CDC in production
+        "poc_note":          "SAP HANA CDC path requires PoC validation. RDI not used (HANA not a supported RDI source).",
+        "source_system":     "SAP_ECC_NSWPOL",
+        "timestamp":         time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "downstream_consumers": "COPS,CAD,AssetRegister,AccessControl"
     })
 
     # Invalidate Redis cache for this asset (forces fresh read next time)
     invalidated = r.delete(f"cache:asset:{asset_id}")
 
-    # Update the asset hash in Redis Search index too
+    # Update the asset hash in Redis Search index
     r.hset(f"asset:{asset_id}", mapping={
         "assigned_to": officer_id,
         "status": "Issued",
@@ -298,13 +315,22 @@ def publish_cdc_event():
         "event_id": event_id,
         "cache_invalidated": bool(invalidated),
         "scenario": f"Sergeant reassigned {asset_id} to {officer_id} in SAP Fiori",
+        "integration_simulated": "OData polling (Option B — safest PoC path)",
+        "poc_required": "All SAP HANA CDC integration paths require validation in NSW Police environment",
+        "integration_options": {
+            "Option_A_SLT":  "Trigger-based CDC, near real-time, ~5-10% HANA write overhead. Licence included in HANA Enterprise / RISE / S4HANA.",
+            "Option_B_OData": "App-layer polling, seconds latency, zero HANA impact. Recommended for PoC.",
+            "Option_C_BTP":  "SAP BTP Integration Suite event-driven. Requires BTP licence check.",
+            "Option_D_ABAP": "Custom ABAP exit. Highest effort, most control.",
+            "RDI_note":      "Redis Data Integration (RDI) does NOT support SAP HANA as a CDC source."
+        },
         "what_happens_next": {
-            "COPS": "Officer profile updated in <100ms",
-            "CAD": "Dispatch system reflects new equipment in <100ms",
+            "COPS":           "Officer profile updated in <100ms",
+            "CAD":            "Dispatch system reflects new equipment in <100ms",
             "Asset_Register": "Chain of custody updated automatically",
             "Access_Control": "Building/vehicle access rights updated"
         },
-        "without_redis": "All systems would remain out of sync until tonight's batch job"
+        "without_redis": "All systems would remain out of sync until tonight batch job"
     })
 
 @app.route("/cdc/stream")
@@ -313,7 +339,7 @@ def read_stream():
     entries = r.xrevrange(STREAM_KEY, count=count)
     return jsonify({
         "stream": STREAM_KEY,
-        "description": "SAP HANA equipment changes captured by RDI connector",
+        "description": "SAP HANA equipment changes — simulating OData polling integration path (PoC required for production)",
         "entry_count": len(entries),
         "entries": [{"event_id": eid, "data": edata} for eid, edata in entries]
     })
@@ -375,7 +401,7 @@ def refresh_report():
         "hana_query_ms": elapsed_ms,
         "cached_key": REPORT_KEY,
         "ttl_seconds": 600,
-        "scenario": "This job runs on schedule (or triggered by RDI on data change). All dashboard reads served from Redis."
+        "scenario": "This job runs on schedule (or triggered by SAP SLT / OData polling on data change). All dashboard reads served from Redis."
     })
 
 @app.route("/report")
@@ -641,10 +667,11 @@ HTML_DASHBOARD = """
 
   <!-- ── USE CASE 3 ── -->
   <div class="card">
-    <p class="card-title">③ Real-Time Equipment Assignment (RDI/CDC)</p>
-    <p class="card-scenario">🔫 Sergeant reassigns equipment in SAP Fiori → Redis propagates to COPS, CAD, Asset Register instantly</p>
+    <p class="card-title">③ SAP HANA → Redis CDC / Event Streaming</p>
+    <p class="card-scenario">🔫 Sergeant reassigns equipment in SAP Fiori → change event flows to Redis Streams → COPS, CAD, Asset Register notified in &lt;100ms</p>
     <span class="tag">Redis Streams</span><span class="tag tag-green">No overnight batch jobs</span>
-    <div class="impact">💡 Without Redis: equipment reassignments sit in SAP until tonight's batch sync. COPS shows wrong officer. CAD dispatches with stale data.</div>
+    <span class="tag" style="background:#3b1f00;color:#fb923c">⚠ PoC required</span>
+    <div class="impact">💡 Demo simulates <strong>OData polling</strong> (zero SAP impact). Production options: SAP SLT trigger-based CDC (~5-10% write overhead, licence included in HANA Enterprise/RISE), SAP BTP Integration Suite, or custom ABAP. <strong>RDI does NOT support SAP HANA as a CDC source</strong> — RDI supports Oracle, SQL Server, MySQL, PostgreSQL.</div>
     <div class="row">
       <div class="field">
         <label>Asset</label>
