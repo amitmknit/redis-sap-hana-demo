@@ -234,7 +234,7 @@ def create_session():
         "session_id": session_id,
         "ttl_seconds": 1800,
         "stored_in": "Redis ONLY — SAP HANA NOT written to ✅",
-        "impact": "Based on the SAP SuccessFactors published study: ~2.4M daily HANA SQL queries eliminated through session offload. NSW Police impact requires PoC sizing.",
+        "impact": "Third-party research (Kumar 2019, IJCEM) on SAP SuccessFactors Learning cited ~2.4M daily HANA SQL queries from session persistence with ~30-40% DB load reduction projected from Redis migration. Not an official SAP study — PoC required for NSW Police sizing.",
         "session": session_data
     })
 
@@ -647,8 +647,9 @@ HTML_DASHBOARD = """
   <div class="card">
     <p class="card-title">② Officer Portal Session Management</p>
     <p class="card-scenario">👮 Officers log into SAP Fiori for HR self-service, leave, rosters — each session hits HANA today</p>
-    <span class="tag">Session store</span><span class="tag tag-green">2.4M SQL queries/day eliminated</span>
-    <div class="impact">💡 SAP SuccessFactors study: session persistence alone generated 2.4M daily HANA SQL queries. Redis eliminates all of them.</div>
+    <span class="tag">Session store</span><span class="tag tag-green">Large HANA query reduction</span>
+    <span class="tag" style="background:#3b1f00;color:#fb923c">⚠ Directional — PoC required</span>
+    <div class="impact">💡 A 2019 third-party research paper (Kumar, IJCEM) on SAP SuccessFactors Learning cited ~2.4M daily HANA SQL queries from session persistence alone, with ~30-40% DB load reduction projected from a Redis migration. <strong>Not an official SAP study</strong> — actual NSW Police impact requires PoC measurement.</div>
     <div class="row">
       <div class="field">
         <label>Officer</label>
