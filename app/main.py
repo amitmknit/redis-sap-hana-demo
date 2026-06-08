@@ -680,6 +680,7 @@ HTML_DASHBOARD = """
     <div class="section-label">Operational Dashboard</div>
     <button onclick="refreshReport()">🔄 Materialise from HANA</button>
     <button class="sec" onclick="getReport()">⚡ Serve from Redis</button>
+    <pre id="report-out">← Click Materialise from HANA first, then Serve from Redis</pre>
 
     <hr class="divider">
 
@@ -696,6 +697,7 @@ HTML_DASHBOARD = """
       </div>
     </div>
     <button class="blue" onclick="searchOfficers()">🔍 Search Officers</button>
+    <pre id="officer-out">← Select filters and click Search Officers</pre>
 
     <hr class="divider">
 
@@ -713,8 +715,7 @@ HTML_DASHBOARD = """
     </div>
     <button class="blue" onclick="searchAssets()">🔍 Search Assets</button>
     <button class="sec" onclick="assetsByStation()">📍 Assets by Station</button>
-
-    <pre id="report-out">← Materialise report first, then use Redis Search to query officer & asset data</pre>
+    <pre id="asset-search-out">← Select filters and click Search Assets or Assets by Station</pre>
   </div>
 
 </div>
@@ -790,7 +791,7 @@ async function searchOfficers() {
   if (q) params.set('q', q);
   if (station) params.set('station', station);
   if (division) params.set('division', division);
-  show('report-out', await api('GET', `/search/officers?${params}`));
+  show('officer-out', await api('GET', `/search/officers?${params}`));
 }
 
 async function searchAssets() {
@@ -801,11 +802,11 @@ async function searchAssets() {
   if (q) params.set('q', q);
   if (category) params.set('category', category);
   if (status) params.set('status', status);
-  show('report-out', await api('GET', `/search/assets?${params}`));
+  show('asset-search-out', await api('GET', `/search/assets?${params}`));
 }
 
 async function assetsByStation() {
-  show('report-out', await api('GET', '/search/assets/by-station'));
+  show('asset-search-out', await api('GET', '/search/assets/by-station'));
 }
 
 async function getRedisInfo() {
