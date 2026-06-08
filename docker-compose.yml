@@ -1,0 +1,54 @@
+version: "3.9"
+
+services:
+
+  # Redis OSS — free, no license needed
+  redis:
+    image: redis:7.2-alpine
+    container_name: redis-demo
+    ports:
+      - "6379:6379"
+    command: redis-server --save "" --loglevel warning
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # PostgreSQL simulates SAP HANA (same SQL dialect for demo purposes)
+  mock-hana:
+    image: postgres:16-alpine
+    container_name: mock-hana
+    environment:
+      POSTGRES_DB: sapdb
+      POSTGRES_USER: sapuser
+      POSTGRES_PASSWORD: sappass
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./data/seed.sql:/docker-entrypoint-initdb.d/seed.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sapuser -d sapdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Demo application (Python Flask)
+  app:
+    build: ./app
+    container_name: redis-sap-demo-app
+    ports:
+      - "5000:5000"
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      PG_HOST: mock-hana
+      PG_PORT: 5432
+      PG_DB: sapdb
+      PG_USER: sapuser
+      PG_PASSWORD: sappass
+    depends_on:
+      redis:
+        condition: service_healthy
+      mock-hana:
+        condition: service_healthy
